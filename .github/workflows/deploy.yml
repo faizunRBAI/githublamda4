@@ -8,23 +8,40 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # required if you ever switch to OIDC
+
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+  S3_KEY: deployment.zip
+  FUNCTION_NAME: githublamda4
+  TF_BACKEND_BUCKET: ${{ secrets.TF_BACKEND_BUCKET }}
+  TF_BACKEND_KEY: githublamda4/terraform.tfstate
+  TF_BACKEND_REGION: us-east-1
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # BUILD — package the Lambda zip artifact
-  # ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # BUILD — install deps, package ZIP, upload to S3
+  # -------------------------------------------------------------------------
   build:
-    name: Build deployment.zip
+    name: Build deployment ZIP
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Install dependencies into package directory
         run: |
@@ -33,76 +50,120 @@ jobs:
 
       - name: Copy application source into package directory
         run: |
-          # Copy the application package
+          # Root-level handler
+          cp lambda_handler.py ./package/
+
+          # App package tree
           cp -r app ./package/app
 
-          # Copy the Lambda adapter at the root of the package
-          cp lambda_handler.py ./package/lambda_handler.py
+          # Include public/ if present (satisfies static-files invariant)
+          if [ -d public ]; then
+            cp -r public ./package/public
+          fi
 
-          # Copy any other top-level modules if present (excluding dev files)
-          # main.py is the local uvicorn runner; it does not need to be in the zip
-          # but including it does no harm
-          if [ -f main.py ]; then cp main.py ./package/main.py; fi
-
-      - name: Create deployment.zip
+      - name: Create deployment ZIP
         run: |
           cd package
-          zip -r ../deployment.zip . -x "*.pyc" -x "*/__pycache__/*" -x "*.dist-info/*"
+          zip -r ../deployment.zip . -x "*.pyc" -x "*/__pycache__/*"
           cd ..
+          echo "ZIP size: $(du -sh deployment.zip | cut -f1)"
 
-      - name: Upload deployment.zip as artifact
+      - name: Upload deployment ZIP to S3
+        run: |
+          aws s3 cp deployment.zip "s3://${S3_BUCKET}/${S3_KEY}"
+
+      - name: Upload deployment ZIP as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: deployment-zip
           path: deployment.zip
           retention-days: 7
 
-  # ---------------------------------------------------------------------------
-  # DEPLOY — push the zip to AWS Lambda
-  # ---------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # DEPLOY — run Terraform then update function code from the S3 artifact
+  # -------------------------------------------------------------------------
   deploy:
     name: Deploy to AWS Lambda
     runs-on: ubuntu-latest
     needs: build
 
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-
     steps:
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
-
-      - name: Download deployment artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: deployment-zip
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Upload zip to Lambda
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+            -backend-config="key=${TF_BACKEND_KEY}" \
+            -backend-config="region=${TF_BACKEND_REGION}"
+
+      - name: Terraform validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="aws_region=${AWS_REGION}" \
+            -var="s3_bucket=${S3_BUCKET}" \
+            -var="s3_key=${S3_KEY}" \
+            -var="function_name=${FUNCTION_NAME}" \
+            -var="app_env=production" \
+            -out=tfplan
+
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Update Lambda function code from S3
         run: |
           aws lambda update-function-code \
-            --function-name githublamda4 \
-            --zip-file fileb://deployment.zip \
-            --region "$AWS_REGION"
+            --function-name "${FUNCTION_NAME}" \
+            --s3-bucket     "${S3_BUCKET}" \
+            --s3-key        "${S3_KEY}" \
+            --region        "${AWS_REGION}"
 
       - name: Wait for Lambda update to complete
         run: |
           aws lambda wait function-updated \
-            --function-name githublamda4 \
-            --region "$AWS_REGION"
+            --function-name "${FUNCTION_NAME}" \
+            --region        "${AWS_REGION}"
 
-      - name: Print Function URL
+      - name: Retrieve and display Function URL
+        run: |
+          FUNCTION_URL=$(aws lambda get-function-url-config \
+            --function-name "${FUNCTION_NAME}" \
+            --region        "${AWS_REGION}" \
+            --query         'FunctionUrl' \
+            --output        text)
+          echo "Function URL: ${FUNCTION_URL}"
+          echo "FUNCTION_URL=${FUNCTION_URL}" >> "$GITHUB_ENV"
+
+      - name: Smoke-test — health check
         run: |-
-          aws lambda get-function-url-config \
-            --function-name githublamda4 \
-            --region "$AWS_REGION" \
-            --query 'FunctionUrl' \
-            --output text
+          echo "Testing ${FUNCTION_URL}health/"
+          HTTP_STATUS=$(curl --silent --output /dev/null \
+            --write-out "%{http_code}" \
+            --max-time 15 \
+            "${FUNCTION_URL}health/")
+          echo "HTTP status: ${HTTP_STATUS}"
+          if [ "${HTTP_STATUS}" != "200" ]; then
+            echo "Smoke test FAILED (expected 200, got ${HTTP_STATUS})"
+            exit 1
+          fi
+          echo "Smoke test passed."

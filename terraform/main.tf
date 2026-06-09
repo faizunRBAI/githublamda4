@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.0"
-    }
   }
 
   backend "s3" {}
@@ -35,14 +31,25 @@ variable "function_name" {
   default     = "githublamda4"
 }
 
-variable "deployment_zip_path" {
-  description = "Path to the deployment zip artifact produced by CI"
+variable "app_env" {
+  description = "Value for the APP_ENV environment variable on the Lambda"
+  type        = string
+  default     = "production"
+}
+
+variable "s3_bucket" {
+  description = "S3 bucket that holds the deployment ZIP"
+  type        = string
+}
+
+variable "s3_key" {
+  description = "S3 key for the deployment ZIP"
   type        = string
   default     = "deployment.zip"
 }
 
 # ---------------------------------------------------------------------------
-# IAM role for the Lambda function
+# IAM execution role
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "lambda_assume_role" {
@@ -62,18 +69,9 @@ resource "aws_iam_role" "lambda_exec" {
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_basic_logs" {
+resource "aws_iam_role_policy_attachment" "basic_execution" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-# ---------------------------------------------------------------------------
-# CloudWatch log group (explicit so Terraform manages retention)
-# ---------------------------------------------------------------------------
-
-resource "aws_cloudwatch_log_group" "lambda_logs" {
-  name              = "/aws/lambda/${var.function_name}"
-  retention_in_days = 14
 }
 
 # ---------------------------------------------------------------------------
@@ -82,32 +80,31 @@ resource "aws_cloudwatch_log_group" "lambda_logs" {
 
 resource "aws_lambda_function" "app" {
   function_name = var.function_name
-  role          = aws_iam_role.lambda_exec.arn
+  description   = "FastAPI app via Mangum"
 
-  # Package is managed by CI via aws lambda update-function-code;
-  # a placeholder filename is required on first apply.
-  filename         = var.deployment_zip_path
-  source_code_hash = filebase64sha256(var.deployment_zip_path)
+  role    = aws_iam_role.lambda_exec.arn
+  runtime = "python3.11"
+  handler = "lambda_handler.handler"
 
-  handler     = "lambda_handler.handler"
-  runtime     = "python3.12"
-  memory_size = 256
-  timeout     = 30
+  s3_bucket = var.s3_bucket
+  s3_key    = var.s3_key
+
+  timeout      = 30
+  memory_size  = 256
 
   environment {
     variables = {
-      APP_ENV = "production"
+      APP_ENV = var.app_env
     }
   }
 
   depends_on = [
-    aws_iam_role_policy_attachment.lambda_basic_logs,
-    aws_cloudwatch_log_group.lambda_logs,
+    aws_iam_role_policy_attachment.basic_execution,
   ]
 }
 
 # ---------------------------------------------------------------------------
-# Lambda Function URL (public, no IAM auth, CORS enabled for browser access)
+# Lambda Function URL  (auth_type NONE + CORS)
 # ---------------------------------------------------------------------------
 
 resource "aws_lambda_function_url" "app_url" {
@@ -118,8 +115,8 @@ resource "aws_lambda_function_url" "app_url" {
     allow_credentials = false
     allow_origins     = ["*"]
     allow_methods     = ["*"]
-    allow_headers     = ["content-type", "authorization", "x-amz-date", "x-api-key"]
-    expose_headers    = ["*"]
+    allow_headers     = ["content-type", "authorization", "x-amz-date", "x-api-key", "x-amz-security-token"]
+    expose_headers    = []
     max_age           = 86400
   }
 }
@@ -129,16 +126,16 @@ resource "aws_lambda_function_url" "app_url" {
 # ---------------------------------------------------------------------------
 
 output "function_name" {
-  description = "Lambda function name"
+  description = "Name of the deployed Lambda function"
   value       = aws_lambda_function.app.function_name
 }
 
-output "function_arn" {
-  description = "Lambda function ARN"
-  value       = aws_lambda_function.app.arn
+output "function_url" {
+  description = "Publicly reachable Function URL"
+  value       = aws_lambda_function_url.app_url.function_url
 }
 
-output "function_url" {
-  description = "Lambda Function URL (public endpoint)"
-  value       = aws_lambda_function_url.app_url.function_url
+output "function_arn" {
+  description = "ARN of the Lambda function"
+  value       = aws_lambda_function.app.arn
 }
